@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+﻿from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import torch.nn.functional as F
 
@@ -67,14 +67,14 @@ def search_identities(req: SearchRequest) -> SearchResponse:
         if key not in deduped or item["score"] > deduped[key]["score"]:
             deduped[key] = item
 
-    raw_results = sorted(deduped.values(), key=lambda x: x["score"], reverse=True)[: req.top_k]
+    ranked = sorted(deduped.values(), key=lambda x: x["score"], reverse=True)[: req.top_k]
     candidates = [
         Candidate(
             platform=item["platform"],
             account=item["uid"],
             score=item["score"],
         )
-        for item in raw_results
+        for item in ranked
     ]
 
     if not candidates:
@@ -120,6 +120,7 @@ def verify_identity(req: VerifyRequest) -> VerifyResponse:
 
     source_ref = IdentityRef(platform=source_platform, account=source_uid)
     target_ref = IdentityRef(platform=target_platform, account=target_uid)
+
     task_id = add_search_task(
         source=source_ref,
         target=target_ref,
@@ -157,7 +158,7 @@ def task_detail(task_id: str) -> DetailItem:
 @app.get("/api/users/suggest", response_model=UserSuggestResponse)
 def user_suggest(platform: str, q: str = "", limit: int = 8) -> UserSuggestResponse:
     normalized_platform = normalize_platform(platform)
-    if normalized_platform not in {"bili", "douyin", "weibo"}:
+    if normalized_platform not in VALID_PLATFORMS:
         raise HTTPException(status_code=400, detail="invalid platform")
     items = suggest_user_ids(platform=normalized_platform, query=q, limit=max(1, min(limit, 50)))
     return UserSuggestResponse(platform=normalized_platform, query=q, items=items)
