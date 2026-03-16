@@ -134,8 +134,8 @@ def train_one_epoch_pair(
             break
 
         label = label.view(-1).float().to(device)
-        emb1 = model(*prepare_model_inputs(feat1, device))
-        emb2 = model(*prepare_model_inputs(feat2, device))
+        emb1 = model(*prepare_model_inputs(feat1, device), feat1["platform"])
+        emb2 = model(*prepare_model_inputs(feat2, device), feat2["platform"])
 
         logits = score_similarity(emb1, emb2, temperature)
         loss = criterion(logits, label)
@@ -181,8 +181,8 @@ def evaluate_pair(
             break
 
         label = label.view(-1).float().to(device)
-        emb1 = model(*prepare_model_inputs(feat1, device))
-        emb2 = model(*prepare_model_inputs(feat2, device))
+        emb1 = model(*prepare_model_inputs(feat1, device), feat1["platform"])
+        emb2 = model(*prepare_model_inputs(feat2, device), feat2["platform"])
 
         logits = score_similarity(emb1, emb2, temperature)
         loss = criterion(logits, label)
@@ -220,9 +220,9 @@ def train_one_epoch_triplet(
         if max_steps > 0 and step > max_steps:
             break
 
-        emb_a = model(*prepare_model_inputs(feat_a, device))
-        emb_p = model(*prepare_model_inputs(feat_p, device))
-        emb_n = model(*prepare_model_inputs(feat_n, device))
+        emb_a = model(*prepare_model_inputs(feat_a, device), feat_a["platform"])
+        emb_p = model(*prepare_model_inputs(feat_p, device), feat_p["platform"])
+        emb_n = model(*prepare_model_inputs(feat_n, device), feat_n["platform"])
 
         s_ap = score_similarity(emb_a, emb_p, temperature)
         s_an = score_similarity(emb_a, emb_n, temperature)
@@ -274,9 +274,9 @@ def evaluate_triplet(
         if max_steps > 0 and step > max_steps:
             break
 
-        emb_a = model(*prepare_model_inputs(feat_a, device))
-        emb_p = model(*prepare_model_inputs(feat_p, device))
-        emb_n = model(*prepare_model_inputs(feat_n, device))
+        emb_a = model(*prepare_model_inputs(feat_a, device), feat_a["platform"])
+        emb_p = model(*prepare_model_inputs(feat_p, device), feat_p["platform"])
+        emb_n = model(*prepare_model_inputs(feat_n, device), feat_n["platform"])
 
         s_ap = score_similarity(emb_a, emb_p, temperature)
         s_an = score_similarity(emb_a, emb_n, temperature)
@@ -318,6 +318,7 @@ def main() -> None:
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--method", default="pair", choices=["pair", "triplet"], help="training sample mode")
     parser.add_argument("--easy_neg_per_anchor", default=1, type=int, help="number of random easy negatives per identity row")
+    parser.add_argument("--debug", default=True, help="whether to use debug mode with simplified dataset")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -332,6 +333,7 @@ def main() -> None:
         max_videos=args.max_videos,
         easy_neg_per_anchor=args.easy_neg_per_anchor,
         seed=args.seed,
+        debug=args.debug,
     )
     val_size = max(1, int(0.1 * len(dataset)))
     train_size = max(1, len(dataset) - val_size)

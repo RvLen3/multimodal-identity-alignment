@@ -41,6 +41,12 @@ def _to_float_count(value) -> float:
     return 0.0
 
 
+def _normalize_to_unit(value: float, max_value: float) -> float:
+    if max_value <= 0:
+        return 0.0
+    return min(max(value, 0.0) / max_value, 1.0)
+
+
 class CrossPlatformDataset(Dataset):
     def __init__(
         self,
@@ -50,6 +56,7 @@ class CrossPlatformDataset(Dataset):
         transform=None,
         easy_neg_per_anchor=1,
         seed=42,
+        debug = True,
     ):
         self.data_dir = data_dir
         self.method = method
@@ -64,11 +71,75 @@ class CrossPlatformDataset(Dataset):
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
-
+        self.debug = debug
+        self.numeric_max = self._build_numeric_max()
         self.data_list = self.get_user_list()
+
+    def _build_numeric_max(self):
+        data_pair = pd.read_csv(f"{self.data_dir}/data.csv")
+
+        id_cols = [("bili", "Bili_id"), ("douyin", "Douyin_id")]
+        if not self.debug:
+            id_cols.append(("weibo", "Weibo_id"))
+
+        max_values = {
+            "following": 1.0,
+            "follower": 1.0,
+            "likes": 1.0,
+            "comments": 1.0,
+            "shares": 1.0,
+        }
+        visited_users = set()
+
+        for _, row in data_pair.iterrows():
+            for plat, col in id_cols:
+                uid = _clean_id(row[col])
+                if not uid:
+                    continue
+
+                user_key = (plat, uid)
+                if user_key in visited_users:
+                    continue
+                visited_users.add(user_key)
+
+                json_path = os.path.join(self.data_dir, plat, uid, f"{uid}.json")
+                if not os.path.exists(json_path):
+                    continue
+
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                except Exception:
+                    continue
+
+                user_info = info.get("creator_profile") or info.get("creator") or {}
+                max_values["following"] = max(max_values["following"], _to_float_count(user_info.get("following", 0)))
+                max_values["follower"] = max(max_values["follower"], _to_float_count(user_info.get("follower", 0)))
+
+                video_info = info.get("videos") or info.get("notes") or []
+                for video in video_info[: self.max_videos]:
+                    max_values["likes"] = max(
+                        max_values["likes"], _to_float_count(video.get("liked_count") or video.get("likes") or 0)
+                    )
+                    max_values["comments"] = max(
+                        max_values["comments"], _to_float_count(video.get("comment_count") or video.get("comment") or 0)
+                    )
+                    max_values["shares"] = max(
+                        max_values["shares"], _to_float_count(video.get("share_count") or video.get("shares") or 0)
+                    )
+
+        return max_values
 
     def get_user_list(self):
         data_pair = pd.read_csv(f"{self.data_dir}/data.csv")
+
+        # debug=True 时仅使用 bilibili/douyin；debug=False 时使用三平台
+        id_cols = [("bili", "Bili_id"), ("douyin", "Douyin_id")]
+        neg_cols = [("bili", "Bili_neg"), ("douyin", "Douyin_neg")]
+        if not self.debug:
+            id_cols.append(("weibo", "Weibo_id"))
+            neg_cols.append(("weibo", "Weibo_neg"))
+
         data_list = []
 
         all_users = set()
@@ -77,7 +148,7 @@ class CrossPlatformDataset(Dataset):
         # First pass: collect anchors/hard negatives and global user pool.
         for _, row in data_pair.iterrows():
             anchors = []
-            for plat, col in [("bili", "Bili_id"), ("douyin", "Douyin_id"), ("weibo", "Weibo_id")]:
+            for plat, col in id_cols:
                 uid = _clean_id(row[col])
                 if uid:
                     node = (plat, uid)
@@ -85,7 +156,7 @@ class CrossPlatformDataset(Dataset):
                     all_users.add(node)
 
             hard_negs = []
-            for plat, col in [("bili", "Bili_neg"), ("douyin", "Douyin_neg"), ("weibo", "Weibo_neg")]:
+            for plat, col in neg_cols:
                 uid = _clean_id(row[col])
                 if uid:
                     node = (plat, uid)
@@ -131,6 +202,7 @@ class CrossPlatformDataset(Dataset):
 
         empty_img = torch.zeros((3, 224, 224))
         feat_dict = {
+            "platform": plat,
             "name": "",
             "sign": "",
             "sex": 0.5,
@@ -159,8 +231,12 @@ class CrossPlatformDataset(Dataset):
         elif sex_str in ["female", "0", "女"]:
             feat_dict["sex"] = 0.0
 
-        feat_dict["following"] = _to_float_count(user_info.get("following", 0))
-        feat_dict["follower"] = _to_float_count(user_info.get("follower", 0))
+        feat_dict["following"] = _normalize_to_unit(
+            _to_float_count(user_info.get("following", 0)), self.numeric_max["following"]
+        )
+        feat_dict["follower"] = _normalize_to_unit(
+            _to_float_count(user_info.get("follower", 0)), self.numeric_max["follower"]
+        )
 
         try:
             feat_dict["avatar"] = self.transform(Image.open(os.path.join(user_dir, f"{uid}.jpg")).convert("RGB"))
@@ -181,9 +257,15 @@ class CrossPlatformDataset(Dataset):
             desc = v.get("desc", "")
             feat_dict["video_titles"][i] = f"{title} {desc}".strip()
 
-            likes = _to_float_count(v.get("liked_count") or v.get("likes") or 0)
-            comments = _to_float_count(v.get("comment_count") or v.get("comment") or 0)
-            shares = _to_float_count(v.get("share_count") or v.get("shares") or 0)
+            likes = _normalize_to_unit(
+                _to_float_count(v.get("liked_count") or v.get("likes") or 0), self.numeric_max["likes"]
+            )
+            comments = _normalize_to_unit(
+                _to_float_count(v.get("comment_count") or v.get("comment") or 0), self.numeric_max["comments"]
+            )
+            shares = _normalize_to_unit(
+                _to_float_count(v.get("share_count") or v.get("shares") or 0), self.numeric_max["shares"]
+            )
             feat_dict["video_stats"][i] = torch.tensor([likes, comments, shares], dtype=torch.float32)
 
             cover_name = f"{vid}_0.jpg" if plat == "weibo" else f"{vid}.jpg"

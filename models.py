@@ -1,7 +1,8 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+from typing import Sequence
 from transformers import AutoModel
 import os
 os.environ["MODELSCOPE_CACHE"] = "/modelscope_cache"
@@ -192,6 +193,9 @@ class MultiModalAlignment(nn.Module):
         # 将共享基座传入两个子模块，确保权重完全一致，且节省显存
         self.UserModel = UserModel(self.cv_base, self.text_base)
         self.ManuModel = ManuModel(self.cv_base, self.text_base)
+        self.Bili_vector = torch.nn.Parameter(torch.randn(128))  # 128维的均值向量，用于消除偏置
+        self.Douyin_vector = torch.nn.Parameter(torch.randn(128))
+        self.Weibo_vector = torch.nn.Parameter(torch.randn(128))
 
         # 最终融合层
         self.Final_Aggregation = nn.Sequential(
@@ -201,8 +205,16 @@ class MultiModalAlignment(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(512, 128)  # 输出 128 维，用于计算相似度/Loss
         )
+        # 平台适配改为“残差小修正”，避免直接映射导致跨平台空间撕裂
+        self.bili_adapter = nn.Linear(128, 128, bias=False)
+        self.douyin_adapter = nn.Linear(128, 128, bias=False)
+        self.weibo_adapter = nn.Linear(128, 128, bias=False)
+        nn.init.zeros_(self.bili_adapter.weight)
+        nn.init.zeros_(self.douyin_adapter.weight)
+        nn.init.zeros_(self.weibo_adapter.weight)
+        self.adapter_scale = 0.1
 
-    def forward(self, user_inputs, manu_inputs):
+    def forward(self, user_inputs, manu_inputs, platform):
         """
         user_inputs: Tuple (avatar, bg, name_tokens, sign_tokens, numerical_feats)
         manu_inputs: Tuple (covers, titles_tokens, stats)
@@ -212,4 +224,39 @@ class MultiModalAlignment(nn.Module):
         works_vector = self.ManuModel(*manu_inputs)
 
         final_concat = torch.cat([user_vector, works_vector], dim=-1)
-        return self.Final_Aggregation(final_concat)
+
+        # 验证一下第一个想法:针对不同平台设置一个专门的映射层，看看能不能消除平台偏置
+        # 这个映射层是加在最开始还是最后?都测试一下
+        final_vector = self.Final_Aggregation(final_concat)
+        final_vector = F.normalize(final_vector, p=2, dim=-1)
+        platform_layers = {
+            "bili": self.bili_adapter,
+            "douyin": self.douyin_adapter,
+            "weibo": self.weibo_adapter,
+        }
+
+        if isinstance(platform, str):
+            if platform not in platform_layers:
+                raise ValueError(f"未知平台: {platform}")
+            adapted = final_vector + self.adapter_scale * platform_layers[platform](final_vector)
+            return F.normalize(adapted, p=2, dim=-1)
+
+        if isinstance(platform, Sequence):
+            if len(platform) != final_vector.size(0):
+                raise ValueError("platform 列表长度必须与 batch size 一致")
+            unknown = sorted(set(p for p in platform if p not in platform_layers))
+            if unknown:
+                raise ValueError(f"未知平台: {unknown}")
+
+            out = torch.empty_like(final_vector)
+            for plat_name, layer in platform_layers.items():
+                idx = [i for i, p in enumerate(platform) if p == plat_name]
+                if not idx:
+                    continue
+                idx_tensor = torch.tensor(idx, device=final_vector.device, dtype=torch.long)
+                selected = final_vector.index_select(0, idx_tensor)
+                adapted = selected + self.adapter_scale * layer(selected)
+                out.index_copy_(0, idx_tensor, F.normalize(adapted, p=2, dim=-1))
+            return out
+
+        raise TypeError(f"platform 应该是 str 或 Sequence[str]，实际为: {type(platform)}")
