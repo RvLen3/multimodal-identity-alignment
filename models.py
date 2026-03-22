@@ -3,14 +3,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from typing import Sequence
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer as HFAutoTokenizer
 import os
 os.environ["MODELSCOPE_CACHE"] = "/modelscope_cache"
-from modelscope import T5ForConditionalGeneration, AutoTokenizer
-model = T5ForConditionalGeneration.from_pretrained('google/byt5-small')
-tokenizer = AutoTokenizer.from_pretrained('google/byt5-small')
+from modelscope import T5ForConditionalGeneration
+
+# 两个预训练的model,一个bert用于处理长文本信息，一个byt5用于处理ID类信息
+# 另外，byt5目前只是借用其tokenizer和底层embedding权重，编码流程并未改造为完整的T5结构，因此命名上暂时不区分，后续如果改造了完整编码器再区分开来
+T5model = T5ForConditionalGeneration.from_pretrained('google/byt5-small')
+T5tokenizer = HFAutoTokenizer.from_pretrained('google/byt5-small')
+PretrainedTokenizer = HFAutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
+PretrainedPath = "hfl/chinese-roberta-wwm-ext"
 
 
+
+
+# 中文长文本编码基座：默认使用中文 RoBERTa
+class BertBackbone(nn.Module):
+    def __init__(self, pretrained_name=PretrainedPath):
+        super().__init__()
+        print(f"正在加载 {pretrained_name} 作为文本基座...")
+        self.bert = AutoModel.from_pretrained(pretrained_name)
+
+    def forward(self, idx, mask_idx):
+        outputs = self.bert(input_ids=idx, attention_mask=mask_idx)
+        return outputs.last_hidden_state[:, 0, :]  # 取 [CLS] token 的输出作为句子特征
 
 
 # ==========================================
@@ -32,15 +49,16 @@ class TextBackbone(nn.Module):
         # 2. 预训练的 Embedding (用于标题和签名等长文本，直接借用 BERT 丰富的先验语义)
         print(f"正在抽取 {pretrained_name} 的底层词嵌入权重...")
 
-        # Need Some Time to Load pretrain Model
-        # pretrained = AutoModel.from_pretrained(pretrained_name)
-
-        pretrained = T5ForConditionalGeneration.from_pretrained(pretrained_name)
+        # ByT5 仅借用底层词嵌入，用于 ID 类文本
+        pretrained = T5model if pretrained_name == "google/byt5-small" else T5ForConditionalGeneration.from_pretrained(pretrained_name)
         self.embedding_pretrained = pretrained.encoder.embed_tokens
 
 
         for param in self.embedding_pretrained.parameters():
             param.requires_grad = False
+
+        # 长文本使用中文 BERT 编码
+        self.bert_backbone = BertBackbone(PretrainedPath)
 
         # 3. 注意力池化打分层: 为每个 token 学习一个重要性权重
         self.attn_score = nn.Linear(embed_dim, 1, bias=False)
@@ -78,7 +96,7 @@ class TextBackbone(nn.Module):
             return (embeds * attn_weights).sum(dim=1)  # 输出: [Batch, EmbedDim]
 
         if method == 'bert':
-            raise NotImplementedError("method='bert' 需要改造为完整编码器前向流程，当前版本暂未实现。")
+            return self.bert_backbone(idx, mask_idx)  # 输出: [Batch, 768]
 
         raise ValueError(f"未知 method: {method}，可选值为 ['mean', 'attention', 'bert']")
 
@@ -111,7 +129,11 @@ class UserModel(nn.Module):
 
         # 不同的投影头，赋予不同字段不同的语义空间
         self.name_head = nn.Linear(1472, 256)
-        self.sign_head = nn.Linear(1472, 256)
+        self.sign_head = nn.Linear(768, 256)
+        self.name_ln = nn.LayerNorm(256)
+        self.sign_ln = nn.LayerNorm(256)
+        self.name_temp = nn.Parameter(torch.tensor(1.0))
+        self.sign_temp = nn.Parameter(torch.tensor(1.0))
         self.avatar_head = nn.Linear(512, 256)
         self.bg_head = nn.Linear(512, 256)
 
@@ -139,8 +161,8 @@ class UserModel(nn.Module):
         v_bg = self.bg_head(self.CVModel(bg))
 
         # 👇【FIXED Bug 2】: 从字典中提取 input_ids 和 attention_mask 传给 TextModel
-        v_name = self.name_head(self.TextModel(name_tokens['input_ids'], name_tokens['attention_mask'], 'id'))
-        v_sign = self.sign_head(self.TextModel(sign_tokens['input_ids'], sign_tokens['attention_mask'], 'sign'))
+        v_name = self.name_ln(self.name_head(self.TextModel(name_tokens['input_ids'], name_tokens['attention_mask'], 'id'))) * self.name_temp
+        v_sign = self.sign_ln(self.sign_head(self.TextModel(sign_tokens['input_ids'], sign_tokens['attention_mask'], 'sign', method='bert'))) * self.sign_temp
 
         v_num = self.num_head(numerical_feats)
 
@@ -155,7 +177,9 @@ class ManuModel(nn.Module):
         self.CVModel = CVModel
         self.TextModel = TextModel
 
-        self.title_head = nn.Linear(1472, 256)
+        self.title_head = nn.Linear(768, 256)
+        self.title_ln = nn.LayerNorm(256)
+        self.title_temp = nn.Parameter(torch.tensor(1.0))
         self.cover_head = nn.Linear(512, 256)
         # 修改为3维：点赞, 评论, 转发
         self.stats_head = nn.Linear(3, 64)
@@ -191,7 +215,7 @@ class ManuModel(nn.Module):
         title_mask_flat = title_mask.view(B * N, S)
 
         # 传入拍平后的 id 和 mask
-        v_title_flat = self.title_head(self.TextModel(titles_flat, title_mask_flat, 'sign'))
+        v_title_flat = self.title_ln(self.title_head(self.TextModel(titles_flat, title_mask_flat, 'sign', method='bert'))) * self.title_temp
         v_title = v_title_flat.view(B, N, -1)  # 恢复维度: [Batch, N, 256]
         if work_valid_mask is not None:
             v_title = v_title * work_valid_mask.unsqueeze(-1).float()

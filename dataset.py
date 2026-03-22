@@ -9,13 +9,15 @@ import pandas as pd
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
-from modelscope import AutoTokenizer
+from transformers import AutoTokenizer
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
 
 os.environ["MODELSCOPE_CACHE"] = "/modelscope_cache"
 
-tokenizer = AutoTokenizer.from_pretrained("google/byt5-small")
+# ID 类文本走 ByT5 tokenizer；长文本走中文 BERT tokenizer
+id_tokenizer = AutoTokenizer.from_pretrained("google/byt5-small")
+long_text_tokenizer = AutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
 
 
 def _clean_id(val):
@@ -329,14 +331,16 @@ class CrossPlatformDataset(Dataset):
 
 
 def _tokenize_and_pack_feat(feat, titles):
-    feat["name_tokens"] = tokenizer(feat["name"], padding=True, return_tensors="pt", max_length=64, truncation=True)
-    feat["sign_tokens"] = tokenizer(feat["sign"], padding=True, return_tensors="pt", max_length=256, truncation=True)
+    feat["name_tokens"] = id_tokenizer(feat["name"], padding=True, return_tensors="pt", max_length=64, truncation=True)
+    feat["sign_tokens"] = long_text_tokenizer(
+        feat["sign"], padding=True, return_tensors="pt", max_length=256, truncation=True
+    )
 
     batch_size = len(titles)
     video_size = len(titles[0]) if batch_size > 0 else 0
     flat_titles = [title for user_titles in titles for title in user_titles]
 
-    flat_tokens = tokenizer(flat_titles, padding=True, truncation=True, max_length=64, return_tensors="pt")
+    flat_tokens = long_text_tokenizer(flat_titles, padding=True, truncation=True, max_length=64, return_tensors="pt")
     seq_len = flat_tokens["input_ids"].shape[1]
 
     feat["video_title_tokens"] = {
