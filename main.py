@@ -17,6 +17,41 @@ def move_tokens_to_device(tokens_dict: Dict[str, torch.Tensor], dev: torch.devic
     return {k: v.to(dev) for k, v in tokens_dict.items()}
 
 
+def is_finite_tensor(x: torch.Tensor) -> bool:
+    return torch.isfinite(x).all().item()
+
+
+def finite_ratio(x: torch.Tensor) -> float:
+    return torch.isfinite(x).float().mean().item()
+
+
+def summarize_tensor(name: str, x: torch.Tensor) -> str:
+    x_detached = x.detach()
+    ratio = finite_ratio(x_detached)
+    if ratio == 0.0:
+        return f"{name}: finite_ratio=0.0000"
+    safe = x_detached[torch.isfinite(x_detached)]
+    return (
+        f"{name}: shape={tuple(x_detached.shape)} finite_ratio={ratio:.4f} "
+        f"min={safe.min().item():.4f} max={safe.max().item():.4f} mean={safe.mean().item():.4f}"
+    )
+
+
+def debug_check_batch(feat: Dict, prefix: str) -> List[str]:
+    msgs = []
+    check_keys = [
+        "profile_numeric",
+        "video_stats",
+        "video_covers",
+        "work_i_is_valid",
+        "work_cover_is_valid",
+    ]
+    for key in check_keys:
+        if key in feat and isinstance(feat[key], torch.Tensor) and not is_finite_tensor(feat[key]):
+            msgs.append(summarize_tensor(f"{prefix}.{key}", feat[key]))
+    return msgs
+
+
 def prepare_model_inputs(feat: Dict, dev: torch.device) -> Tuple[Tuple, Tuple]:
     user_inputs = (
         feat["avatar"].to(dev),
@@ -29,6 +64,8 @@ def prepare_model_inputs(feat: Dict, dev: torch.device) -> Tuple[Tuple, Tuple]:
         feat["video_covers"].to(dev),
         move_tokens_to_device(feat["video_title_tokens"], dev),
         feat["video_stats"].to(dev),
+        feat["work_i_is_valid"].to(dev),
+        feat["work_cover_is_valid"].to(dev),
     )
     return user_inputs, manu_inputs
 
@@ -122,6 +159,9 @@ def train_one_epoch_pair(
     device: torch.device,
     temperature: float,
     max_steps: int,
+    nan_debug: bool,
+    max_nan_logs: int,
+    grad_clip: float,
 ) -> Tuple[float, float, float]:
     model.train()
     total_loss, total_correct, total_count = 0.0, 0, 0
@@ -129,19 +169,49 @@ def train_one_epoch_pair(
     all_labels: List[float] = []
 
     pbar = tqdm(dataloader, desc="train(pair)", leave=False)
+    nan_logs = 0
     for step, (feat1, feat2, label) in enumerate(pbar, start=1):
         if max_steps > 0 and step > max_steps:
             break
 
         label = label.view(-1).float().to(device)
+        if nan_debug and nan_logs < max_nan_logs:
+            bad_inputs = debug_check_batch(feat1, "feat1") + debug_check_batch(feat2, "feat2")
+            if bad_inputs:
+                print(f"[NaNDebug][pair][step={step}] non-finite batch inputs:")
+                for msg in bad_inputs:
+                    print("  -", msg)
+                nan_logs += 1
+
         emb1 = model(*prepare_model_inputs(feat1, device), feat1["platform"])
         emb2 = model(*prepare_model_inputs(feat2, device), feat2["platform"])
+        if not is_finite_tensor(emb1) or not is_finite_tensor(emb2):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][pair][step={step}] embedding became non-finite")
+                print("  -", summarize_tensor("emb1", emb1))
+                print("  -", summarize_tensor("emb2", emb2))
+                nan_logs += 1
+            continue
 
         logits = score_similarity(emb1, emb2, temperature)
         loss = criterion(logits, label)
+        if (not is_finite_tensor(logits)) or (not torch.isfinite(loss).item()):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][pair][step={step}] logits/loss became non-finite")
+                print("  -", summarize_tensor("logits", logits))
+                print("  -", summarize_tensor("label", label))
+                print(f"  - loss={loss.item()}")
+                print(
+                    f"  - work_valid_count(feat1)={feat1['work_i_is_valid'].sum(dim=1).tolist()} "
+                    f"work_valid_count(feat2)={feat2['work_i_is_valid'].sum(dim=1).tolist()}"
+                )
+                nan_logs += 1
+            continue
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         with torch.no_grad():
@@ -169,6 +239,8 @@ def evaluate_pair(
     device: torch.device,
     temperature: float,
     max_steps: int,
+    nan_debug: bool,
+    max_nan_logs: int,
 ) -> Tuple[float, float, float]:
     model.eval()
     total_loss, total_correct, total_count = 0.0, 0, 0
@@ -176,6 +248,7 @@ def evaluate_pair(
     all_labels: List[float] = []
 
     pbar = tqdm(dataloader, desc="valid(pair)", leave=False)
+    nan_logs = 0
     for step, (feat1, feat2, label) in enumerate(pbar, start=1):
         if max_steps > 0 and step > max_steps:
             break
@@ -183,9 +256,24 @@ def evaluate_pair(
         label = label.view(-1).float().to(device)
         emb1 = model(*prepare_model_inputs(feat1, device), feat1["platform"])
         emb2 = model(*prepare_model_inputs(feat2, device), feat2["platform"])
+        if (not is_finite_tensor(emb1)) or (not is_finite_tensor(emb2)):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][val-pair][step={step}] embedding became non-finite")
+                print("  -", summarize_tensor("emb1", emb1))
+                print("  -", summarize_tensor("emb2", emb2))
+                nan_logs += 1
+            continue
 
         logits = score_similarity(emb1, emb2, temperature)
         loss = criterion(logits, label)
+        if (not is_finite_tensor(logits)) or (not torch.isfinite(loss).item()):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][val-pair][step={step}] logits/loss became non-finite")
+                print("  -", summarize_tensor("logits", logits))
+                print("  -", summarize_tensor("label", label))
+                print(f"  - loss={loss.item()}")
+                nan_logs += 1
+            continue
 
         pred = (torch.sigmoid(logits) >= 0.5).float()
         total_correct += (pred == label).sum().item()
@@ -209,6 +297,9 @@ def train_one_epoch_triplet(
     device: torch.device,
     temperature: float,
     max_steps: int,
+    nan_debug: bool,
+    max_nan_logs: int,
+    grad_clip: float,
 ) -> Tuple[float, float, float]:
     model.train()
     total_loss, total_correct, total_count = 0.0, 0, 0
@@ -216,6 +307,7 @@ def train_one_epoch_triplet(
     all_labels: List[float] = []
 
     pbar = tqdm(dataloader, desc="train(triplet)", leave=False)
+    nan_logs = 0
     for step, (feat_a, feat_p, feat_n) in enumerate(pbar, start=1):
         if max_steps > 0 and step > max_steps:
             break
@@ -223,6 +315,14 @@ def train_one_epoch_triplet(
         emb_a = model(*prepare_model_inputs(feat_a, device), feat_a["platform"])
         emb_p = model(*prepare_model_inputs(feat_p, device), feat_p["platform"])
         emb_n = model(*prepare_model_inputs(feat_n, device), feat_n["platform"])
+        if (not is_finite_tensor(emb_a)) or (not is_finite_tensor(emb_p)) or (not is_finite_tensor(emb_n)):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][triplet][step={step}] embedding became non-finite")
+                print("  -", summarize_tensor("emb_a", emb_a))
+                print("  -", summarize_tensor("emb_p", emb_p))
+                print("  -", summarize_tensor("emb_n", emb_n))
+                nan_logs += 1
+            continue
 
         s_ap = score_similarity(emb_a, emb_p, temperature)
         s_an = score_similarity(emb_a, emb_n, temperature)
@@ -230,9 +330,26 @@ def train_one_epoch_triplet(
         logits = s_ap - s_an
         target = torch.ones_like(logits)
         loss = criterion(logits, target)
+        if (not is_finite_tensor(logits)) or (not torch.isfinite(loss).item()):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][triplet][step={step}] logits/loss became non-finite")
+                print("  -", summarize_tensor("s_ap", s_ap))
+                print("  -", summarize_tensor("s_an", s_an))
+                print("  -", summarize_tensor("logits", logits))
+                print(f"  - loss={loss.item()}")
+                print(
+                    "  - work_valid_count=",
+                    feat_a["work_i_is_valid"].sum(dim=1).tolist(),
+                    feat_p["work_i_is_valid"].sum(dim=1).tolist(),
+                    feat_n["work_i_is_valid"].sum(dim=1).tolist(),
+                )
+                nan_logs += 1
+            continue
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         with torch.no_grad():
@@ -263,6 +380,8 @@ def evaluate_triplet(
     device: torch.device,
     temperature: float,
     max_steps: int,
+    nan_debug: bool,
+    max_nan_logs: int,
 ) -> Tuple[float, float, float]:
     model.eval()
     total_loss, total_correct, total_count = 0.0, 0, 0
@@ -270,6 +389,7 @@ def evaluate_triplet(
     all_labels: List[float] = []
 
     pbar = tqdm(dataloader, desc="valid(triplet)", leave=False)
+    nan_logs = 0
     for step, (feat_a, feat_p, feat_n) in enumerate(pbar, start=1):
         if max_steps > 0 and step > max_steps:
             break
@@ -277,6 +397,14 @@ def evaluate_triplet(
         emb_a = model(*prepare_model_inputs(feat_a, device), feat_a["platform"])
         emb_p = model(*prepare_model_inputs(feat_p, device), feat_p["platform"])
         emb_n = model(*prepare_model_inputs(feat_n, device), feat_n["platform"])
+        if (not is_finite_tensor(emb_a)) or (not is_finite_tensor(emb_p)) or (not is_finite_tensor(emb_n)):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][val-triplet][step={step}] embedding became non-finite")
+                print("  -", summarize_tensor("emb_a", emb_a))
+                print("  -", summarize_tensor("emb_p", emb_p))
+                print("  -", summarize_tensor("emb_n", emb_n))
+                nan_logs += 1
+            continue
 
         s_ap = score_similarity(emb_a, emb_p, temperature)
         s_an = score_similarity(emb_a, emb_n, temperature)
@@ -284,6 +412,15 @@ def evaluate_triplet(
         logits = s_ap - s_an
         target = torch.ones_like(logits)
         loss = criterion(logits, target)
+        if (not is_finite_tensor(logits)) or (not torch.isfinite(loss).item()):
+            if nan_debug and nan_logs < max_nan_logs:
+                print(f"[NaNDebug][val-triplet][step={step}] logits/loss became non-finite")
+                print("  -", summarize_tensor("s_ap", s_ap))
+                print("  -", summarize_tensor("s_an", s_an))
+                print("  -", summarize_tensor("logits", logits))
+                print(f"  - loss={loss.item()}")
+                nan_logs += 1
+            continue
 
         pred = (logits >= 0).float()
         total_correct += pred.sum().item()
@@ -318,13 +455,20 @@ def main() -> None:
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--method", default="pair", choices=["pair", "triplet"], help="training sample mode")
     parser.add_argument("--easy_neg_per_anchor", default=1, type=int, help="number of random easy negatives per identity row")
-    parser.add_argument("--debug", default=True, help="whether to use debug mode with simplified dataset")
+    parser.add_argument("--grad_clip", default=1.0, type=float, help="max grad norm; <=0 disables")
+    parser.add_argument("--nan_debug", dest="nan_debug", action="store_true", help="print non-finite diagnostics")
+    parser.add_argument("--no-nan_debug", dest="nan_debug", action="store_false", help="disable non-finite diagnostics")
+    parser.add_argument("--max_nan_logs", default=20, type=int, help="max diagnostic logs per train/val pass")
+    parser.add_argument("--debug", dest="debug", action="store_true", help="use debug mode (bili/douyin only)")
+    parser.add_argument("--no-debug", dest="debug", action="store_false", help="use full mode (bili/douyin/weibo)")
+    parser.set_defaults(debug=True, nan_debug=True)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"[Info] device={device}")
+    print(f"[Info] args={args}")
     print(f"[Info] loading dataset method={args.method}...")
 
     dataset = CrossPlatformDataset(
@@ -369,17 +513,35 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         if args.method == "pair":
             train_loss, train_acc, train_auc = train_one_epoch_pair(
-                model, train_loader, optimizer, criterion, device, args.temperature, args.max_train_steps
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                args.temperature,
+                args.max_train_steps,
+                args.nan_debug,
+                args.max_nan_logs,
+                args.grad_clip,
             )
             val_loss, val_acc, val_auc = evaluate_pair(
-                model, val_loader, criterion, device, args.temperature, args.max_valid_steps
+                model, val_loader, criterion, device, args.temperature, args.max_valid_steps, args.nan_debug, args.max_nan_logs
             )
         else:
             train_loss, train_acc, train_auc = train_one_epoch_triplet(
-                model, train_loader, optimizer, criterion, device, args.temperature, args.max_train_steps
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                device,
+                args.temperature,
+                args.max_train_steps,
+                args.nan_debug,
+                args.max_nan_logs,
+                args.grad_clip,
             )
             val_loss, val_acc, val_auc = evaluate_triplet(
-                model, val_loader, criterion, device, args.temperature, args.max_valid_steps
+                model, val_loader, criterion, device, args.temperature, args.max_valid_steps, args.nan_debug, args.max_nan_logs
             )
 
         history.append(

@@ -42,17 +42,45 @@ class TextBackbone(nn.Module):
         for param in self.embedding_pretrained.parameters():
             param.requires_grad = False
 
-    def forward(self, idx, mask_idx, type='id'):
+        # 3. 注意力池化打分层: 为每个 token 学习一个重要性权重
+        self.attn_score = nn.Linear(embed_dim, 1, bias=False)
+
+    def forward(self, idx, mask_idx, type='id', method='mean'):
+        # 规定一下，type must be 'id' or 'sign'，分别对应随机初始化的 embedding 和 预训练的 embedding
+        # method must be 'mean' or 'attention' or 'bert'
+        # bert 方案需要替换为完整编码器结构，这里先保留占位
+
         # 选择对应的 Embedding 层
         Emb = self.embedding if type == 'id' else self.embedding_pretrained
 
+        # 对文本进行编码，得到 [Batch, SeqLen, EmbedDim] 的特征表示
         embeds = Emb(idx)
-        mask_expanded = mask_idx.unsqueeze(-1).float()
-        embeds = embeds * mask_expanded
-        sum_embeds = embeds.sum(dim=1)
-        lens = mask_idx.sum(dim=1, keepdim=True).clamp(min=1e-9)
 
-        return sum_embeds / lens  # 输出: [Batch, EmbedDim]
+        if method == 'mean':
+            mask_expanded = mask_idx.unsqueeze(-1).float()
+            embeds = embeds * mask_expanded
+            sum_embeds = embeds.sum(dim=1)
+            lens = mask_idx.sum(dim=1, keepdim=True).clamp(min=1e-9).float()
+            return sum_embeds / lens  # 输出: [Batch, EmbedDim]
+
+        if method == 'attention':
+            # 对每个 token 打分，然后在有效 token 上做 softmax 得到注意力权重
+            attn_logits = self.attn_score(embeds).squeeze(-1)  # [Batch, SeqLen]
+            attn_logits = attn_logits.masked_fill(mask_idx <= 0, float('-inf'))
+
+            # 避免整行无有效 token 时 softmax 产生 NaN
+            no_valid_row = (mask_idx.sum(dim=1) <= 0)
+            if no_valid_row.any():
+                attn_logits = attn_logits.clone()
+                attn_logits[no_valid_row] = 0.0
+
+            attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)  # [Batch, SeqLen, 1]
+            return (embeds * attn_weights).sum(dim=1)  # 输出: [Batch, EmbedDim]
+
+        if method == 'bert':
+            raise NotImplementedError("method='bert' 需要改造为完整编码器前向流程，当前版本暂未实现。")
+
+        raise ValueError(f"未知 method: {method}，可选值为 ['mean', 'attention', 'bert']")
 
 
 class CVBackbone(nn.Module):
@@ -74,9 +102,6 @@ class CVBackbone(nn.Module):
         return self.fc(features)  # 输出: [Batch, 512]
 
 
-# ==========================================
-# 2. 模态对齐子网络
-# ==========================================
 
 class UserModel(nn.Module):
     def __init__(self, CVModel, TextModel):
@@ -90,9 +115,10 @@ class UserModel(nn.Module):
         self.avatar_head = nn.Linear(512, 256)
         self.bg_head = nn.Linear(512, 256)
 
-        # 离散/数值特征处理 (修改为3维：性别, 关注数, 粉丝数)
+        # 离散/数值特征处理:
+        # [sex, following, follower, num_works_norm, has_name, has_sign, has_avatar, has_top_photo, top_photo_is_imputed]
         self.num_head = nn.Sequential(
-            nn.Linear(3, 64),
+            nn.Linear(9, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Linear(64, 128)
@@ -137,9 +163,9 @@ class ManuModel(nn.Module):
         self.item_fusion = nn.Linear(256 + 256 + 64, 256)
         self.attention_pooling = nn.MultiheadAttention(embed_dim=256, num_heads=4, batch_first=True)
 
-    # 👇【FIXED Bug 2】: 接收字典类型的 titles_tokens
-    def forward(self, covers, titles_tokens, stats):
-        # 注意：这里的输入包含作品序列维度 N
+
+    def forward(self, covers, titles_tokens, stats, work_valid_mask=None, cover_valid_mask=None):
+
         # covers shape: [Batch, N, C, H, W]
         # stats  shape: [Batch, N, 3]
 
@@ -154,6 +180,8 @@ class ManuModel(nn.Module):
         covers_flat = covers.view(B * N, C, H, W)
         v_cover_flat = self.cover_head(self.CVModel(covers_flat))
         v_cover = v_cover_flat.view(B, N, -1)  # 恢复维度: [Batch, N, 256]
+        if cover_valid_mask is not None:
+            v_cover = v_cover * cover_valid_mask.unsqueeze(-1).float()
 
         # 2. 处理文本特征：同理合并维度
         S = titles.shape[2]
@@ -165,16 +193,36 @@ class ManuModel(nn.Module):
         # 传入拍平后的 id 和 mask
         v_title_flat = self.title_head(self.TextModel(titles_flat, title_mask_flat, 'sign'))
         v_title = v_title_flat.view(B, N, -1)  # 恢复维度: [Batch, N, 256]
+        if work_valid_mask is not None:
+            v_title = v_title * work_valid_mask.unsqueeze(-1).float()
 
         # 3. 处理数值特征
         v_stats = self.stats_head(stats)  # Linear层自动作用于最后一个维度: [Batch, N, 64]
+        if work_valid_mask is not None:
+            v_stats = v_stats * work_valid_mask.unsqueeze(-1).float()
 
         # 4. 融合单条作品特征
         item_feats = F.relu(self.item_fusion(torch.cat([v_cover, v_title, v_stats], dim=-1)))  # [Batch, N, 256]
 
-        # 5. 序列注意力池化
-        attn_out, _ = self.attention_pooling(item_feats, item_feats, item_feats)
-        works_feat = torch.mean(attn_out, dim=1)  # 压缩作品序列 -> [Batch, 256]
+        # 5. 序列注意力池化 + mask
+        key_padding_mask = None
+        safe_valid_for_attn = None
+        if work_valid_mask is not None:
+            # MHA 不接受“整行全部被 mask”，否则会产生 NaN
+            safe_valid_for_attn = work_valid_mask.float()
+            no_valid_row = safe_valid_for_attn.sum(dim=1) <= 0
+            if no_valid_row.any():
+                safe_valid_for_attn = safe_valid_for_attn.clone()
+                safe_valid_for_attn[no_valid_row, 0] = 1.0
+            key_padding_mask = safe_valid_for_attn <= 0
+        attn_out, _ = self.attention_pooling(item_feats, item_feats, item_feats, key_padding_mask=key_padding_mask)
+
+        if work_valid_mask is None:
+            works_feat = torch.mean(attn_out, dim=1)
+        else:
+            valid = work_valid_mask.unsqueeze(-1).float()
+            denom = valid.sum(dim=1).clamp(min=1.0)
+            works_feat = (attn_out * valid).sum(dim=1) / denom
 
         return works_feat
 

@@ -268,7 +268,7 @@ export default function LandingPage() {
             <div className="mt-8 grid gap-4 sm:grid-cols-3">
               <div className="rounded-2xl border border-slate-200 bg-white p-4">
                 <p className="text-xs uppercase tracking-wider text-slate-500">Node Scale</p>
-                <p className="mt-1 text-2xl font-semibold text-slate-900">10B+</p>
+                <p className="mt-1 text-2xl font-semibold text-slate-900">1,000+</p>
               </div>
               <div className="rounded-2xl border border-slate-200 bg-white p-4">
                 <p className="text-xs uppercase tracking-wider text-slate-500">API Status</p>
@@ -616,9 +616,9 @@ export default function LandingPage() {
         <section className="mt-12 rounded-3xl border border-slate-200 bg-white p-6 md:p-8">
           <div className="grid gap-6 md:grid-cols-[1fr_auto] md:items-center">
             <div>
-              <h2 className="text-2xl font-semibold text-slate-900">准备进入系统查看任务流？</h2>
+              <h2 className="text-2xl font-semibold text-slate-900">进入后台系统查看任务流</h2>
               <p className="mt-2 text-sm leading-relaxed text-slate-600">
-                首页演示已与后端接口对齐。你可以直接进入系统页查看任务队列、详情矩阵与判定输出。
+                To Be Continue
               </p>
               <div className="mt-4 flex flex-wrap gap-2 text-xs">
                 <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-slate-600">

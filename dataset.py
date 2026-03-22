@@ -1,5 +1,6 @@
 ﻿import json
 import os
+import math
 import random
 from itertools import combinations
 from typing import Dict, List, Tuple
@@ -24,25 +25,32 @@ def _clean_id(val):
 
 
 def _to_float_count(value) -> float:
+    if pd.isna(value):
+        return 0.0
     if isinstance(value, (int, float)):
-        return float(value)
+        val = float(value)
+        return val if math.isfinite(val) else 0.0
     if isinstance(value, str):
         text = value.strip().replace(",", "")
         if not text:
             return 0.0
+        if text.lower() in {"nan", "none", "null", "inf", "-inf"}:
+            return 0.0
         if "万" in text:
-            return float(text.replace("万", "")) * 10000.0
+            base = float(text.replace("万", ""))
+            return base * 10000.0 if math.isfinite(base) else 0.0
         if text.isdigit():
             return float(text)
         try:
-            return float(text)
+            val = float(text)
+            return val if math.isfinite(val) else 0.0
         except ValueError:
             return 0.0
     return 0.0
 
 
 def _normalize_to_unit(value: float, max_value: float) -> float:
-    if max_value <= 0:
+    if (not math.isfinite(value)) or (not math.isfinite(max_value)) or max_value <= 0:
         return 0.0
     return min(max(value, 0.0) / max_value, 1.0)
 
@@ -210,6 +218,14 @@ class CrossPlatformDataset(Dataset):
             "follower": 0.0,
             "avatar": empty_img,
             "top_photo": empty_img,
+            "has_name": torch.tensor(0.0, dtype=torch.float32),
+            "has_sign": torch.tensor(0.0, dtype=torch.float32),
+            "has_avatar": torch.tensor(0.0, dtype=torch.float32),
+            "has_top_photo": torch.tensor(0.0, dtype=torch.float32),
+            "top_photo_is_imputed": torch.tensor(0.0, dtype=torch.float32),
+            "num_works": torch.tensor(0.0, dtype=torch.float32),
+            "work_i_is_valid": torch.zeros(self.max_videos, dtype=torch.float32),
+            "work_cover_is_valid": torch.zeros(self.max_videos, dtype=torch.float32),
             "video_titles": ["" for _ in range(self.max_videos)],
             "video_stats": torch.zeros((self.max_videos, 3)),
             "video_covers": torch.zeros((self.max_videos, 3, 224, 224)),
@@ -222,8 +238,10 @@ class CrossPlatformDataset(Dataset):
             info = json.load(f)
 
         user_info = info.get("creator_profile") or info.get("creator") or {}
-        feat_dict["name"] = user_info.get("name", "")
-        feat_dict["sign"] = user_info.get("sign", "")
+        feat_dict["name"] = (user_info.get("name", "") or "").strip()
+        feat_dict["sign"] = (user_info.get("sign", "") or "").strip()
+        feat_dict["has_name"] = torch.tensor(1.0 if feat_dict["name"] else 0.0, dtype=torch.float32)
+        feat_dict["has_sign"] = torch.tensor(1.0 if feat_dict["sign"] else 0.0, dtype=torch.float32)
 
         sex_str = str(user_info.get("sex", "")).lower()
         if sex_str in ["male", "1", "男"]:
@@ -238,18 +256,33 @@ class CrossPlatformDataset(Dataset):
             _to_float_count(user_info.get("follower", 0)), self.numeric_max["follower"]
         )
 
+        avatar_loaded = False
         try:
             feat_dict["avatar"] = self.transform(Image.open(os.path.join(user_dir, f"{uid}.jpg")).convert("RGB"))
+            feat_dict["has_avatar"] = torch.tensor(1.0, dtype=torch.float32)
+            avatar_loaded = True
         except Exception:
             pass
 
+        top_photo_loaded = False
         try:
             feat_dict["top_photo"] = self.transform(Image.open(os.path.join(user_dir, "top_photo.jpg")).convert("RGB"))
+            feat_dict["has_top_photo"] = torch.tensor(1.0, dtype=torch.float32)
+            top_photo_loaded = True
         except Exception:
             pass
+        if (not top_photo_loaded) and avatar_loaded:
+            # 当 top_photo 缺失时，使用 avatar 代替，并显式告知这是替代值
+            feat_dict["top_photo"] = feat_dict["avatar"].clone()
+            feat_dict["top_photo_is_imputed"] = torch.tensor(1.0, dtype=torch.float32)
 
         video_info = info.get("videos") or info.get("notes") or []
-        for i in range(min(len(video_info), self.max_videos)):
+        valid_works = min(len(video_info), self.max_videos)
+        feat_dict["num_works"] = torch.tensor(float(valid_works), dtype=torch.float32)
+        if valid_works > 0:
+            feat_dict["work_i_is_valid"][:valid_works] = 1.0
+
+        for i in range(valid_works):
             v = video_info[i]
             vid = v.get("aweme_id") or v.get("note_id") or v.get("bvid") or ""
 
@@ -273,6 +306,7 @@ class CrossPlatformDataset(Dataset):
                 feat_dict["video_covers"][i] = self.transform(
                     Image.open(os.path.join(user_dir, cover_name)).convert("RGB")
                 )
+                feat_dict["work_cover_is_valid"][i] = 1.0
             except Exception:
                 pass
 
@@ -311,8 +345,19 @@ def _tokenize_and_pack_feat(feat, titles):
     }
     feat["video_titles"] = titles
 
+    num_works_norm = feat["num_works"].float() / max(float(video_size), 1.0)
     feat["profile_numeric"] = torch.stack(
-        [feat["sex"].float(), feat["following"].float(), feat["follower"].float()],
+        [
+            feat["sex"].float(),
+            feat["following"].float(),
+            feat["follower"].float(),
+            num_works_norm,
+            feat["has_name"].float(),
+            feat["has_sign"].float(),
+            feat["has_avatar"].float(),
+            feat["has_top_photo"].float(),
+            feat["top_photo_is_imputed"].float(),
+        ],
         dim=1,
     )
     return feat
