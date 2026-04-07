@@ -8,26 +8,38 @@ import os
 os.environ["MODELSCOPE_CACHE"] = "/modelscope_cache"
 from modelscope import T5ForConditionalGeneration
 
-# 两个预训练的model,一个bert用于处理长文本信息，一个byt5用于处理ID类信息
-# 另外，byt5目前只是借用其tokenizer和底层embedding权重，编码流程并未改造为完整的T5结构，因此命名上暂时不区分，后续如果改造了完整编码器再区分开来
-T5model = T5ForConditionalGeneration.from_pretrained('google/byt5-small')
-T5tokenizer = HFAutoTokenizer.from_pretrained('google/byt5-small')
-PretrainedTokenizer = HFAutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
-PretrainedPath = "hfl/chinese-roberta-wwm-ext"
+DEFAULT_ID_PRETRAINED = "google/byt5-small"
+DEFAULT_LONG_PRETRAINED = "hfl/chinese-roberta-wwm-ext"
+T5model = T5ForConditionalGeneration.from_pretrained(DEFAULT_ID_PRETRAINED)
+T5tokenizer = HFAutoTokenizer.from_pretrained(DEFAULT_ID_PRETRAINED)
+PretrainedTokenizer = HFAutoTokenizer.from_pretrained(DEFAULT_LONG_PRETRAINED)
+PretrainedPath = DEFAULT_LONG_PRETRAINED
 
 
 
 
 # 中文长文本编码基座：默认使用中文 RoBERTa
 class BertBackbone(nn.Module):
-    def __init__(self, pretrained_name=PretrainedPath):
+    def __init__(self, pretrained_name=DEFAULT_LONG_PRETRAINED):
         super().__init__()
         print(f"正在加载 {pretrained_name} 作为文本基座...")
         self.bert = AutoModel.from_pretrained(pretrained_name)
 
     def forward(self, idx, mask_idx):
-        outputs = self.bert(input_ids=idx, attention_mask=mask_idx)
+        # Transformers attention_mask 使用 0/1 整型更稳妥
+        outputs = self.bert(input_ids=idx, attention_mask=mask_idx.long())
         return outputs.last_hidden_state[:, 0, :]  # 取 [CLS] token 的输出作为句子特征
+
+
+class T5Backbone(nn.Module):
+    def __init__(self, pretrained_name=DEFAULT_ID_PRETRAINED):
+        super().__init__()
+        print(f"正在加载 {pretrained_name} 作为 ID 文本基座...")
+        self.t5 = T5model if pretrained_name == DEFAULT_ID_PRETRAINED else T5ForConditionalGeneration.from_pretrained(pretrained_name)
+
+    def forward(self, idx, mask_idx):
+        outputs = self.t5.encoder(input_ids=idx, attention_mask=mask_idx.long())
+        return outputs.last_hidden_state  # [Batch, SeqLen, Hidden]
 
 
 # ==========================================
@@ -40,50 +52,75 @@ class TextBackbone(nn.Module):
     既能使用预训练的 Tokenizer 词表，又大幅节省显存
     """
 
-    def __init__(self, vocab_size=384, embed_dim=1472, pretrained_name="google/byt5-small"):
+    def __init__(self, vocab_size=384, embed_dim=1472, pretrained_name=None):
         super().__init__()
-        # 1. 随机初始化的 Embedding (用于网名等短文本，从头学习特定领域的字面特征)
-        # padding_idx=0 保证了填充位置的特征始终为 0，不参与计算和梯度更新
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        # pretrained_name 支持两种形式:
+        # 1) str: 仅覆盖 id 文本模型，long 文本仍用默认中文 BERT
+        # 2) dict: {"id": "...", "long": "..."} 分别覆盖两类文本模型
+        if pretrained_name is None:
+            id_pretrained_name = DEFAULT_ID_PRETRAINED
+            long_pretrained_name = DEFAULT_LONG_PRETRAINED
+        elif isinstance(pretrained_name, str):
+            id_pretrained_name = pretrained_name
+            long_pretrained_name = DEFAULT_LONG_PRETRAINED
+        elif isinstance(pretrained_name, dict):
+            id_pretrained_name = pretrained_name.get("id", DEFAULT_ID_PRETRAINED)
+            long_pretrained_name = pretrained_name.get("long", DEFAULT_LONG_PRETRAINED)
+        else:
+            raise TypeError("pretrained_name 必须是 None / str / dict")
 
-        # 2. 预训练的 Embedding (用于标题和签名等长文本，直接借用 BERT 丰富的先验语义)
-        print(f"正在抽取 {pretrained_name} 的底层词嵌入权重...")
+        print(f"正在抽取 {id_pretrained_name} 的底层词嵌入权重...")
 
-        # ByT5 仅借用底层词嵌入，用于 ID 类文本
-        pretrained = T5model if pretrained_name == "google/byt5-small" else T5ForConditionalGeneration.from_pretrained(pretrained_name)
+        # ID 文本使用 ByT5 词嵌入/编码器
+        pretrained = T5model if id_pretrained_name == DEFAULT_ID_PRETRAINED else T5ForConditionalGeneration.from_pretrained(id_pretrained_name)
         self.embedding_pretrained = pretrained.encoder.embed_tokens
-
 
         for param in self.embedding_pretrained.parameters():
             param.requires_grad = False
 
-        # 长文本使用中文 BERT 编码
-        self.bert_backbone = BertBackbone(PretrainedPath)
+        # 长文本使用 BERT；ID 文本可切换到 ByT5 编码器
+        self.bert_backbone = BertBackbone(long_pretrained_name)
+        self.t5_backbone = T5Backbone(id_pretrained_name)
 
-        # 3. 注意力池化打分层: 为每个 token 学习一个重要性权重
-        self.attn_score = nn.Linear(embed_dim, 1, bias=False)
+        # 注意力池化打分层: 输入维度从预训练 embedding 自动推断，避免硬编码
+        self.id_hidden_dim = self.embedding_pretrained.embedding_dim
+        self.attn_score = nn.Linear(self.id_hidden_dim, 1, bias=False)
 
     def forward(self, idx, mask_idx, type='id', method='mean'):
-        # 规定一下，type must be 'id' or 'sign'，分别对应随机初始化的 embedding 和 预训练的 embedding
-        # method must be 'mean' or 'attention' or 'bert'
-        # bert 方案需要替换为完整编码器结构，这里先保留占位
+        # args:
+        # type: 'id' 或 'sign'，分别对应两类文本；method: 'baseline', 'mean', 'attention', 'bert' 四种编码方式
+        if type not in {'id', 'sign'}:
+            raise ValueError(f"未知 type: {type}，可选值为 ['id', 'sign']")
 
-        # 选择对应的 Embedding 层
-        Emb = self.embedding if type == 'id' else self.embedding_pretrained
+        if method == 'bert' or type == 'sign':
+            # sign/long 文本默认走 BERT 编码；dataset 已自动添加 special tokens
+            return self.bert_backbone(idx, mask_idx)  # 输出: [Batch, 768]
 
-        # 对文本进行编码，得到 [Batch, SeqLen, EmbedDim] 的特征表示
-        embeds = Emb(idx)
+        # 到这里默认是 ID 文本(ByT5)
+        embeds = self.embedding_pretrained(idx)
 
-        if method == 'mean':
+        if method == 'baseline':
+            # 直接对Embedding后的文本做均值池化
             mask_expanded = mask_idx.unsqueeze(-1).float()
             embeds = embeds * mask_expanded
             sum_embeds = embeds.sum(dim=1)
             lens = mask_idx.sum(dim=1, keepdim=True).clamp(min=1e-9).float()
             return sum_embeds / lens  # 输出: [Batch, EmbedDim]
 
+        # mean/attention 使用 ByT5 encoder 后的上下文特征
+        encoded = self.t5_backbone(idx, mask_idx)
+
+        if method == 'mean':
+            # 对Encoder后的文本做均值池化
+            mask_expanded = mask_idx.unsqueeze(-1).float()
+            encoded = encoded * mask_expanded
+            sum_encoded = encoded.sum(dim=1)
+            lens = mask_idx.sum(dim=1, keepdim=True).clamp(min=1e-9).float()
+            return sum_encoded / lens
+
         if method == 'attention':
             # 对每个 token 打分，然后在有效 token 上做 softmax 得到注意力权重
-            attn_logits = self.attn_score(embeds).squeeze(-1)  # [Batch, SeqLen]
+            attn_logits = self.attn_score(encoded).squeeze(-1)  # [Batch, SeqLen]
             attn_logits = attn_logits.masked_fill(mask_idx <= 0, float('-inf'))
 
             # 避免整行无有效 token 时 softmax 产生 NaN
@@ -93,12 +130,9 @@ class TextBackbone(nn.Module):
                 attn_logits[no_valid_row] = 0.0
 
             attn_weights = F.softmax(attn_logits, dim=1).unsqueeze(-1)  # [Batch, SeqLen, 1]
-            return (embeds * attn_weights).sum(dim=1)  # 输出: [Batch, EmbedDim]
+            return (encoded * attn_weights).sum(dim=1)  # 输出: [Batch, EmbedDim]
 
-        if method == 'bert':
-            return self.bert_backbone(idx, mask_idx)  # 输出: [Batch, 768]
-
-        raise ValueError(f"未知 method: {method}，可选值为 ['mean', 'attention', 'bert']")
+        raise ValueError(f"未知 method: {method}，可选值为 ['baseline', 'mean', 'attention', 'bert']")
 
 
 class CVBackbone(nn.Module):

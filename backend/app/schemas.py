@@ -9,7 +9,7 @@ class IdentityRef(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    source: IdentityRef
+    source: IdentityRef # platform and id
     target_platforms: List[str] = Field(default_factory=list)
     top_k: int = 5
 
